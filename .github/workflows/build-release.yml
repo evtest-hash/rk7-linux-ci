@@ -1,0 +1,225 @@
+name: Build
+run-name: Build with Inmusic ${{ github.event.inputs.board }} Production Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: Select board to build
+        required: true
+        default: AZ04B
+        type: choice
+        options:
+          - AZ04B
+          - AZ07
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      SOURCE_DIR: ${{ github.workspace }}/source
+      RAW_IMAGE_DIR: output/raw/Image
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ssh make gcc libssl-dev liblz4-tool expect g++ patchelf chrpath \
+            gawk texinfo diffstat software-properties-common bison flex fakeroot \
+            cmake gcc-multilib g++-multilib unzip device-tree-compiler libncurses-dev \
+            python3-pip python3-pyelftools bc build-essential zlib1g-dev libbz2-dev \
+            libreadline-dev libsqlite3-dev wget curl llvm libncursesw5-dev xz-utils \
+            tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev uuid-dev lzma-dev \
+            libbluetooth-dev u-boot-tools sudo time rsync libmpc-dev bsdmainutils \
+            gettext xxd binfmt-support qemu-user-static git-lfs python-is-python3 \
+            ca-certificates file
+
+          git lfs install
+
+      - name: Install repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+          repo version
+
+      - name: Prepare build directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          df -h
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/cache /mnt/output "${SOURCE_DIR}"
+          if [[ -e "${SOURCE_DIR}/output" && ! -L "${SOURCE_DIR}/output" ]]; then
+            rm -rf "${SOURCE_DIR}/output"
+          fi
+          sudo ln -sfn /mnt/output "${SOURCE_DIR}/output"
+          workspace_owner="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
+          sudo chown -R "${workspace_owner}" /mnt/cache /mnt/output "${SOURCE_DIR}"
+          df -h
+
+      - name: Resolve board config
+        id: board
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ github.event.inputs.board }}" in
+            AZ04B)
+              echo "manifest_file=rk3588-linux6.1-stan-rkr7.xml" >> "${GITHUB_OUTPUT}"
+              echo "chip=rk3588" >> "${GITHUB_OUTPUT}"
+              echo "defconfig=rockchip_rk3588s_inmusic_az04b_defconfig" >> "${GITHUB_OUTPUT}"
+              printf '%s\n%s\n' \
+                "external/camera_engine_rkaiq" \
+                "prebuilts/gcc/linux-x86/aarch64/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf" \
+                > "${RUNNER_TEMP}/lfs-paths.txt"
+              ;;
+            AZ07)
+              echo "manifest_file=rk3566_rk3568-linux6.1-stan-rkr7.xml" >> "${GITHUB_OUTPUT}"
+              echo "chip=rk3566_rk3568" >> "${GITHUB_OUTPUT}"
+              echo "defconfig=rockchip_rk3566_inmusic_az07_defconfig" >> "${GITHUB_OUTPUT}"
+              printf '%s\n' "external/camera_engine_rkaiq" > "${RUNNER_TEMP}/lfs-paths.txt"
+              ;;
+            *)
+              echo "Unsupported board: ${{ github.event.inputs.board }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Download source code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${SOURCE_DIR}"
+          repo init \
+            -u https://github.com/mixtile-rockchip/manifests.git \
+            -b linux-6.1-stan-rkr7 \
+            -m "${{ steps.board.outputs.manifest_file }}"
+          repo sync -j"$(nproc)" --force-sync
+
+      - name: Setup GitLab HTTPS credentials
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GITLAB_TOKEN}" ]]; then
+            echo "Missing required repository secret: GITLAB_TOKEN" >&2
+            exit 1
+          fi
+
+          cat > ~/.netrc <<EOF
+          machine code.focalcrest.com
+          login oauth2
+          password ${GITLAB_TOKEN}
+          EOF
+          chmod 600 ~/.netrc
+          sudo cp ~/.netrc /root/.netrc
+          sudo chmod 600 /root/.netrc
+
+      - name: Checkout LFS objects
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${SOURCE_DIR}"
+          while IFS= read -r repo_path; do
+            [[ -n "${repo_path}" ]] || continue
+            cd "${SOURCE_DIR}/${repo_path}"
+            git lfs fetch --all
+            git lfs checkout
+          done < "${RUNNER_TEMP}/lfs-paths.txt"
+
+      - name: Copy inMusic logo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp assets/logo/inMusic.bmp "${SOURCE_DIR}/kernel/logo.bmp"
+          cp assets/logo/inMusic.bmp "${SOURCE_DIR}/kernel/logo_kernel.bmp"
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${SOURCE_DIR}"
+          sudo ./build.sh "chip:${{ steps.board.outputs.chip }}:${{ steps.board.outputs.defconfig }}"
+          sudo ./build.sh all
+
+      - name: Rename and compress raw image
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DATE=$(date +%Y-%m-%d)
+          BOARD="${{ github.event.inputs.board }}"
+
+          cd "${SOURCE_DIR}/${RAW_IMAGE_DIR}"
+          sudo mv raw.img "image-raw-format-${BOARD}-Production-Test-${DATE}.img"
+          sudo xz -4 --force --quiet --threads=0 "image-raw-format-${BOARD}-Production-Test-${DATE}.img"
+          sudo chown "${USER}:${USER}" "image-raw-format-${BOARD}-Production-Test-${DATE}.img.xz"
+
+          echo "archive_path=${SOURCE_DIR}/${RAW_IMAGE_DIR}/image-raw-format-${BOARD}-Production-Test-${DATE}.img.xz" >> "${GITHUB_OUTPUT}"
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Build summary"
+            echo
+            echo "- Board: ${{ github.event.inputs.board }}"
+            echo "- Manifest: ${{ steps.board.outputs.manifest_file }}"
+            echo "- Defconfig: ${{ steps.board.outputs.defconfig }}"
+            echo
+            echo "### Disk usage"
+            echo '```'
+            df -h
+            echo
+            du -sh "${SOURCE_DIR}" "${SOURCE_DIR}/.repo" "${SOURCE_DIR}/buildroot" /mnt/output 2>/dev/null || true
+            echo '```'
+            if [[ -n "${{ steps.package.outputs.archive_path }}" ]]; then
+              echo
+              echo "### Artifact"
+              echo '```'
+              ls -lh "${{ steps.package.outputs.archive_path }}"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload raw image artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-image-${{ github.event.inputs.board }}
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Clean cache
+        if: always()
+        shell: bash
+        run: |
+          sync
+          sudo rm -rf /mnt/output
+          sync
