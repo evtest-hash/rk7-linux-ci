@@ -7,13 +7,13 @@ CI/CD repository for building RK7 Rockchip Linux images.
 - AZ07
 
 ## Build Type
-- Validation build
+- Production Test
 
 ## How to Trigger Build
 GitHub Actions -> Build -> Select Board
 
 ## Outputs
-- Compressed Rockchip `raw.img` artifact (`.img.xz`)
+- Compressed Rockchip `raw.img` in GitHub Release (`.img.xz`)
 
 ## Required Repository Secret
 - `GITLAB_TOKEN`

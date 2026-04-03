@@ -14,7 +14,7 @@ on:
           - AZ07
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -55,62 +55,31 @@ jobs:
           sudo chmod a+x /usr/local/bin/repo
           repo version
 
-      - name: Prepare build directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          df -h
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo mkdir -p /mnt/cache /mnt/output "${SOURCE_DIR}"
-          if [[ -e "${SOURCE_DIR}/output" && ! -L "${SOURCE_DIR}/output" ]]; then
-            rm -rf "${SOURCE_DIR}/output"
-          fi
-          sudo ln -sfn /mnt/output "${SOURCE_DIR}/output"
-          workspace_owner="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          sudo chown -R "${workspace_owner}" /mnt/cache /mnt/output "${SOURCE_DIR}"
-          df -h
-
-      - name: Resolve board config
-        id: board
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          case "${{ github.event.inputs.board }}" in
-            AZ04B)
-              echo "manifest_file=rk3588-linux6.1-stan-rkr7.xml" >> "${GITHUB_OUTPUT}"
-              echo "chip=rk3588" >> "${GITHUB_OUTPUT}"
-              echo "defconfig=rockchip_rk3588s_inmusic_az04b_defconfig" >> "${GITHUB_OUTPUT}"
-              printf '%s\n%s\n' \
-                "external/camera_engine_rkaiq" \
-                "prebuilts/gcc/linux-x86/aarch64/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf" \
-                > "${RUNNER_TEMP}/lfs-paths.txt"
-              ;;
-            AZ07)
-              echo "manifest_file=rk3566_rk3568-linux6.1-stan-rkr7.xml" >> "${GITHUB_OUTPUT}"
-              echo "chip=rk3566_rk3568" >> "${GITHUB_OUTPUT}"
-              echo "defconfig=rockchip_rk3566_inmusic_az07_defconfig" >> "${GITHUB_OUTPUT}"
-              printf '%s\n' "external/camera_engine_rkaiq" > "${RUNNER_TEMP}/lfs-paths.txt"
-              ;;
-            *)
-              echo "Unsupported board: ${{ github.event.inputs.board }}" >&2
-              exit 1
-              ;;
-          esac
-
       - name: Download source code
         shell: bash
         run: |
           set -euo pipefail
 
+          mkdir -p "${SOURCE_DIR}"
           cd "${SOURCE_DIR}"
-          repo init \
-            -u https://github.com/mixtile-rockchip/manifests.git \
-            -b linux-6.1-stan-rkr7 \
-            -m "${{ steps.board.outputs.manifest_file }}"
+
+          if [ "${{ github.event.inputs.board }}" = "AZ04B" ]; then
+            repo init \
+              -u https://github.com/mixtile-rockchip/manifests.git \
+              -b linux-6.1-stan-rkr7 \
+              -m rk3588-linux6.1-stan-rkr7.xml
+          elif [ "${{ github.event.inputs.board }}" = "AZ07" ]; then
+            repo init \
+              -u https://github.com/mixtile-rockchip/manifests.git \
+              -b linux-6.1-stan-rkr7 \
+              -m rk3566_rk3568-linux6.1-stan-rkr7.xml
+          else
+            echo "Unsupported board: ${{ github.event.inputs.board }}" >&2
+            exit 1
+          fi
+
           repo sync -j"$(nproc)" --force-sync
+          repo forall -c 'git lfs fetch --all && git lfs checkout'
 
       - name: Setup GitLab HTTPS credentials
         shell: bash
@@ -133,19 +102,6 @@ jobs:
           sudo cp ~/.netrc /root/.netrc
           sudo chmod 600 /root/.netrc
 
-      - name: Checkout LFS objects
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "${SOURCE_DIR}"
-          while IFS= read -r repo_path; do
-            [[ -n "${repo_path}" ]] || continue
-            cd "${SOURCE_DIR}/${repo_path}"
-            git lfs fetch --all
-            git lfs checkout
-          done < "${RUNNER_TEMP}/lfs-paths.txt"
-
       - name: Copy inMusic logo
         shell: bash
         run: |
@@ -160,7 +116,12 @@ jobs:
           set -euo pipefail
 
           cd "${SOURCE_DIR}"
-          sudo ./build.sh "chip:${{ steps.board.outputs.chip }}:${{ steps.board.outputs.defconfig }}"
+
+          if [ "${{ github.event.inputs.board }}" = "AZ04B" ]; then
+            sudo ./build.sh chip:rk3588:rockchip_rk3588s_inmusic_az04b_defconfig
+          elif [ "${{ github.event.inputs.board }}" = "AZ07" ]; then
+            sudo ./build.sh chip:rk3566_rk3568:rockchip_rk3566_inmusic_az07_defconfig
+          fi
           sudo ./build.sh all
 
       - name: Rename and compress raw image
@@ -179,47 +140,25 @@ jobs:
 
           echo "archive_path=${SOURCE_DIR}/${RAW_IMAGE_DIR}/image-raw-format-${BOARD}-Production-Test-${DATE}.img.xz" >> "${GITHUB_OUTPUT}"
 
-      - name: Build summary
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          {
-            echo "## Build summary"
-            echo
-            echo "- Board: ${{ github.event.inputs.board }}"
-            echo "- Manifest: ${{ steps.board.outputs.manifest_file }}"
-            echo "- Defconfig: ${{ steps.board.outputs.defconfig }}"
-            echo
-            echo "### Disk usage"
-            echo '```'
-            df -h
-            echo
-            du -sh "${SOURCE_DIR}" "${SOURCE_DIR}/.repo" "${SOURCE_DIR}/buildroot" /mnt/output 2>/dev/null || true
-            echo '```'
-            if [[ -n "${{ steps.package.outputs.archive_path }}" ]]; then
-              echo
-              echo "### Artifact"
-              echo '```'
-              ls -lh "${{ steps.package.outputs.archive_path }}"
-              echo '```'
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: Upload raw image artifact
-        if: success()
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: raw-image-${{ github.event.inputs.board }}
-          path: ${{ steps.package.outputs.archive_path }}
-          if-no-files-found: error
-          retention-days: 7
+          tag_name: ${{ github.event.inputs.board }}-Production-Test-${{ github.run_id }}
+          name: ${{ github.event.inputs.board }} Production Test Build ${{ github.run_id }}
+          body: |
+            ${{ github.event.inputs.board }} Production Test Image
+            Build Date: ${{ github.event.repository.updated_at }}
+            Run ID: ${{ github.run_id }}
+          files: ${{ steps.package.outputs.archive_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Clean cache
         if: always()
         shell: bash
         run: |
           sync
-          sudo rm -rf /mnt/output
+          sudo rm -rf "${SOURCE_DIR}/output"
           sync
