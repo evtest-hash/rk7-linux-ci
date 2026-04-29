@@ -140,18 +140,33 @@ jobs:
 
           echo "archive_path=${SOURCE_DIR}/${RAW_IMAGE_DIR}/image-raw-format-${BOARD}-Production-Test-${DATE}.img.xz" >> "${GITHUB_OUTPUT}"
 
+      - name: Prepare release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_DATE_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TAG_TIMESTAMP_UTC="$(date -u +%Y%m%d%H%M%S)"
+          BOARD="${{ github.event.inputs.board }}"
+          TAG_NAME="Production-Test-${TAG_TIMESTAMP_UTC}-${BOARD}"
+
+          echo "build_date_utc=${BUILD_DATE_UTC}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.event.inputs.board }}-Production-Test-${{ github.run_id }}
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
           name: ${{ github.event.inputs.board }} Production Test Build ${{ github.run_id }}
           body: |
             ${{ github.event.inputs.board }} Production Test Image
-            Build Date: ${{ github.event.repository.updated_at }}
+            Build Date: ${{ steps.release_meta.outputs.build_date_utc }}
             Run ID: ${{ github.run_id }}
           files: ${{ steps.package.outputs.archive_path }}
           draft: false
           prerelease: false
+          make_latest: legacy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
